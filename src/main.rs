@@ -1,110 +1,109 @@
+use std::io::{stdout, Write};
+
 use gstreamer::{
-    prelude::{ElementExt, GObjectExtManualGst, GstBinExtManual, GstObjectExt, PadExt},
-    Bin, ClockTime, DebugGraphDetails, Element, ElementFactory, MessageView, Pipeline, State,
+    prelude::{Displayable, ElementExt, ElementExtManual},
+    query::Seeking,
+    ClockTime, Element, ElementFactory, Format, Message, MessageView, SeekFlags, State,
 };
-use gtk4::prelude::{Cast, ObjectExt};
+
+struct Data {
+    playbin: Element,
+    playing: bool,
+    terminate: bool,
+    seek_enabled: bool,
+    seek_done: bool,
+    duration: Option<ClockTime>,
+}
 
 fn main() {
     gstreamer::init().unwrap();
 
-    let source = ElementFactory::make("uridecodebin")
-        .name("source")
+    let playbin = ElementFactory::make("playbin")
+        .name("playbin")
+        .property("uri", "file:///home/yummi/Downloads/a.mkv")
         .build()
         .unwrap();
 
-    let convert = ElementFactory::make("audioconvert")
-        .name("convert")
-        .build()
-        .unwrap();
-    let resample = ElementFactory::make("audioresample")
-        .name("resample")
-        .build()
-        .unwrap();
-    let sink = ElementFactory::make("autoaudiosink")
-        .name("sink")
-        .build()
-        .unwrap();
-    let vconvert = ElementFactory::make("videoconvert")
-        .name("vconvert")
-        .build()
-        .unwrap();
-    let vsink = ElementFactory::make("autovideosink")
-        .name("vsink")
-        .build()
-        .unwrap();
-    let vertigo = ElementFactory::make("warptv")
-        .name("vertigo")
-        .build()
-        .unwrap();
+    playbin.set_state(State::Playing).unwrap();
 
-    let pipeline = Pipeline::with_name("test-pipeline");
+    let bus = playbin.bus().unwrap();
+    let mut data = Data {
+        playbin,
+        playing: false,
+        terminate: false,
+        seek_enabled: false,
+        seek_done: false,
+        duration: ClockTime::NONE,
+    };
 
-    pipeline
-        .add_many([&source, &convert, &resample, &sink, &vconvert, &vertigo, &vsink])
-        .unwrap();
-    Element::link_many([&convert, &resample, &sink]).unwrap();
-    Element::link_many([&vconvert, &vertigo, &vsink]).unwrap();
+    while !data.terminate {
+        let msg = bus.timed_pop(100 * ClockTime::MSECOND);
 
-    source.set_property("uri", "file:/home/yummi/Downloads/a.mkv");
+        if let Some(msg) = msg {
+            handle_message(&mut data, &msg);
+        } else {
+            if data.playing {
+                let position = data.playbin.query_position::<ClockTime>().unwrap();
 
-    source.connect_pad_added(move |src, src_pad| {
-        println!("Received new pad {} from {}", src_pad.name(), src.name());
+                if data.duration == ClockTime::NONE {
+                    data.duration = data.playbin.query_duration();
+                }
 
-        let new_pad_caps = src_pad.current_caps().unwrap();
-        let new_pad_struct = new_pad_caps.structure(0).unwrap();
-        let new_pad_type = new_pad_struct.name();
+                print!("\rPosition {} / {}", position, data.duration.display());
+                stdout().flush().unwrap();
 
-        let sink_pad = match new_pad_type.to_string().as_ref() {
-            "audio/x-raw" => convert.static_pad("sink"),
-            "video/x-raw" => vconvert.static_pad("sink"),
-            _ => None,
-        };
-
-        if let Some(sink_pad) = sink_pad {
-            if !sink_pad.is_linked() {
-                let res = src_pad.link(&sink_pad);
-                if res.is_err() {
-                    println!("Type is {new_pad_type} but link failed.");
-                } else {
-                    println!("Link succeeded (type {new_pad_type}).");
+                if data.seek_enabled && data.seek_done && position > 10 * ClockTime::SECOND {
+                    println!("\nReached 10s, performing seek...");
+                    data.playbin
+                        .seek_simple(
+                            SeekFlags::FLUSH | SeekFlags::KEY_UNIT,
+                            30 * ClockTime::SECOND,
+                        )
+                        .expect("Failed to seek.");
+                    data.seek_done = true;
                 }
             }
-        }
-    });
-
-    pipeline.set_state(State::Playing).unwrap();
-
-    boilerplate(pipeline);
-}
-
-fn boilerplate(pipeline: Pipeline) {
-    let bus = pipeline.bus().unwrap();
-    for msg in bus.iter_timed(ClockTime::NONE) {
-        match msg.view() {
-            MessageView::Error(err) => {
-                eprintln!(
-                    "Error received from element {:?} {}",
-                    err.src().map(|s| s.path_string()),
-                    err.error()
-                );
-                eprintln!("Debugging information: {:?}", err.debug());
-                break;
-            }
-            MessageView::StateChanged(state_changed) => {
-                if state_changed.src().map(|s| s == &pipeline).unwrap_or(false) {
-                    println!(
-                        "Pipeline state changed from {:?} to {:?}",
-                        state_changed.old(),
-                        state_changed.current()
-                    );
-                }
-            }
-            MessageView::Eos(..) => break,
-            _ => (),
         }
     }
 
-    pipeline
-        .set_state(State::Null)
-        .expect("Unable to set the pipeline to the `Null` state");
+    data.playbin.set_state(State::Null).unwrap();
+}
+
+fn handle_message(data: &mut Data, msg: &Message) {
+    match msg.view() {
+        MessageView::DurationChanged(_) => {
+            data.duration = ClockTime::NONE;
+        }
+        MessageView::StateChanged(state) => {
+            if state.src().map(|s| s == &data.playbin).unwrap_or(false) {
+                let new_state = state.current();
+                let old_state = state.old();
+
+                println!("Pipeline state changed from {old_state:?} to {new_state:?}");
+
+                data.playing = new_state == State::Playing;
+                if data.playing {
+                    let mut seeking = Seeking::new(Format::Time);
+                    if data.playbin.query(&mut seeking) {
+                        let (seekable, start, end) = seeking.result();
+                        data.seek_enabled = seekable;
+                        if seekable {
+                            println!("Seeking is ENABLED from {start} to {end}")
+                        } else {
+                            println!("Seeking is DISABLED for this stream.")
+                        }
+                    } else {
+                        eprintln!("Seeking query failed.")
+                    }
+                }
+            }
+        }
+        MessageView::Eos(_) => {
+            data.terminate = true;
+        }
+        MessageView::Error(err) => {
+            data.terminate = true;
+        }
+        _ => (),
+    }
 }
