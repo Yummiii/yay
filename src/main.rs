@@ -1,109 +1,110 @@
-use std::io::{stdout, Write};
-
 use gstreamer::{
-    prelude::{Displayable, ElementExt, ElementExtManual},
-    query::Seeking,
-    ClockTime, Element, ElementFactory, Format, Message, MessageView, SeekFlags, State,
+    message::Application, prelude::ElementExt, ClockTime, Element, ElementFactory, Message, State,
+    Structure,
 };
+use gtk4::{
+    gdk::Paintable, glib::Value, prelude::{ApplicationExt, ApplicationExtManual, ObjectExt, ToValue}, Box, HeaderBar, ListBox, Orientation, Picture, SelectionMode, Video, Widget
+};
+use libadwaita::{
+    prelude::{ActionRowExt, BoxExt, GtkWindowExt},
+    ActionRow, ApplicationWindow,
+};
+use utils::make;
+
+mod utils;
 
 struct Data {
     playbin: Element,
-    playing: bool,
-    terminate: bool,
-    seek_enabled: bool,
-    seek_done: bool,
+    sink_widget: Option<Paintable>,
+    state: State,
     duration: Option<ClockTime>,
 }
 
 fn main() {
+    libadwaita::init().unwrap();
+    gtk4::init().unwrap();
+    let app = libadwaita::Application::builder()
+        .application_id("com.sexo")
+        .build();
     gstreamer::init().unwrap();
 
-    let playbin = ElementFactory::make("playbin")
-        .name("playbin")
-        .property("uri", "file:///home/yummi/Downloads/a.mkv")
-        .build()
-        .unwrap();
-
-    playbin.set_state(State::Playing).unwrap();
-
-    let bus = playbin.bus().unwrap();
     let mut data = Data {
-        playbin,
-        playing: false,
-        terminate: false,
-        seek_enabled: false,
-        seek_done: false,
-        duration: ClockTime::NONE,
+        playbin: make("playbin"),
+        sink_widget: None,
+        state: State::Null,
+        duration: None,
     };
 
-    while !data.terminate {
-        let msg = bus.timed_pop(100 * ClockTime::MSECOND);
+    let videosink = make("glsinkbin");
+    let gtkglsink = make("gtk4paintablesink");
 
-        if let Some(msg) = msg {
-            handle_message(&mut data, &msg);
-        } else {
-            if data.playing {
-                let position = data.playbin.query_position::<ClockTime>().unwrap();
+    videosink.set_property("sink", &gtkglsink);
+    let aaaa = gtkglsink.property::<Paintable>("paintable");
 
-                if data.duration == ClockTime::NONE {
-                    data.duration = data.playbin.query_duration();
-                }
+    println!("{:?}", data.sink_widget);
 
-                print!("\rPosition {} / {}", position, data.duration.display());
-                stdout().flush().unwrap();
+    data.playbin
+        .set_property("uri", "file:///home/yummi/Downloads/a.mkv");
+    data.playbin.set_property("video-sink", &videosink);
 
-                if data.seek_enabled && data.seek_done && position > 10 * ClockTime::SECOND {
-                    println!("\nReached 10s, performing seek...");
-                    data.playbin
-                        .seek_simple(
-                            SeekFlags::FLUSH | SeekFlags::KEY_UNIT,
-                            30 * ClockTime::SECOND,
-                        )
-                        .expect("Failed to seek.");
-                    data.seek_done = true;
-                }
-            }
-        }
-    }
+    data.playbin.connect("video-tags-changed", false, tags_cb);
+    data.playbin.connect("audio-tags-changed", false, tags_cb);
+    data.playbin.connect("text-tags-changed", false, tags_cb);
 
-    data.playbin.set_state(State::Null).unwrap();
+
+
+    app.connect_activate(move |app| {
+        let content = Box::new(Orientation::Vertical, 0);
+
+        content.append(&HeaderBar::new());
+        // let a = &data.sink_widget.unwrap();
+
+        let a = Picture::new();
+        a.set_paintable(Some(&aaaa));
+
+        content.append(&a);
+
+        let window = ApplicationWindow::builder()
+            .application(app)
+            .title("First App")
+            .default_width(350)
+            .content(&content)
+            .build();
+        window.present();
+    });
+
+    let bus = data.playbin.bus().unwrap();
+
+    bus.add_signal_watch();
+    bus.connect("message::error", false, |a| {
+        println!("erro");
+        None
+    });
+    bus.connect("message::eos", false, |a| {
+        println!("eos");
+        None
+    });
+    bus.connect("message::state-changed", false, |a| {
+        println!("a");
+        None
+    });
+    bus.connect("message::application", false, |a| {
+        println!("app");
+        None
+    });
+
+    data.playbin.set_state(State::Playing).unwrap();
+    app.run();
 }
 
-fn handle_message(data: &mut Data, msg: &Message) {
-    match msg.view() {
-        MessageView::DurationChanged(_) => {
-            data.duration = ClockTime::NONE;
-        }
-        MessageView::StateChanged(state) => {
-            if state.src().map(|s| s == &data.playbin).unwrap_or(false) {
-                let new_state = state.current();
-                let old_state = state.old();
 
-                println!("Pipeline state changed from {old_state:?} to {new_state:?}");
+fn tags_cb<'a>(value: &'a [Value]) -> Option<Value> {
+    if let [playbin, _] = value {
+        let playbin = playbin.get::<Element>().unwrap();
 
-                data.playing = new_state == State::Playing;
-                if data.playing {
-                    let mut seeking = Seeking::new(Format::Time);
-                    if data.playbin.query(&mut seeking) {
-                        let (seekable, start, end) = seeking.result();
-                        data.seek_enabled = seekable;
-                        if seekable {
-                            println!("Seeking is ENABLED from {start} to {end}")
-                        } else {
-                            println!("Seeking is DISABLED for this stream.")
-                        }
-                    } else {
-                        eprintln!("Seeking query failed.")
-                    }
-                }
-            }
-        }
-        MessageView::Eos(_) => {
-            data.terminate = true;
-        }
-        MessageView::Error(err) => {
-            data.terminate = true;
-        }
-        _ => (),
+        playbin
+            .post_message(Application::new(Structure::new_empty("tags-changed")))
+            .unwrap();
     }
+    None
 }
